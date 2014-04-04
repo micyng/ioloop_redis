@@ -1,39 +1,43 @@
 ioloop_redis
-============
+========
 
 another async redis lib for tornado, short and intuitive
 
-Sample
-------
+<br/>
 
-    from __future__ import absolute_import
-    from tornado import httpserver
-    from tornado.web import Application, RequestHandler
-    from tornado.gen import coroutine
-    from redis_client import *
+##Sample
+-----------
 
-
-    _queue = AsyncRedis('redis://localhost:6379/1')
-
-
-    class HelloworldHandler(RequestHandler):
-        @coroutine
-        def get(self):
-            next_cmd = yield _queue.invoke(redis_lpop('key'))
-            #do sth.
-            self.write(next_cmd)
-            self.finish()
+```py:sample.py
+from __future__ import absolute_import
+from tornado import httpserver
+from tornado.web import Application, RequestHandler
+from tornado.gen import coroutine
+from redis_client import *
 
 
-    def main():
-        app = Application([
-            ('/', HelloworldHandler),
-        ])
-
-        server = httpserver.HTTPServer(app)
-        server.listen(8000)
-        IOLoop.instance().start()
+_queue = AsyncRedis('redis://localhost:6379/1')
 
 
-    if __name__ == "__main__":
-        main()
+class HelloworldHandler(RequestHandler):
+    @coroutine
+    def get(self):
+        next_cmd = yield _queue.invoke(redis_lpop('key'))
+        #do sth.
+        self.write(next_cmd)
+        self.finish()
+
+
+def main():
+    app = Application([
+        ('/', HelloworldHandler),
+    ])
+
+    server = httpserver.HTTPServer(app)
+    server.listen(8000)
+    IOLoop.instance().start()
+
+
+if __name__ == "__main__":
+    main()
+```

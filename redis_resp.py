@@ -158,21 +158,26 @@ def decode_redis_resp(s, batch_count=None):
     return True, tuple(result), remain
 
 
-def decode_resp_ondemand(buf, has_select, trans_active, cmd_count):
+#+OK\r\n
+CONNECT_RESP_LEN = 5
+
+
+def decode_resp_ondemand(buf, connect_count, trans_active, cmd_count):
     """用于应答，按需解析buf
 
     :param buf: 应答buf
-    :param has_select: 是否包含select db指令
+    :param connect_count: AUTH, ECHO, PING, SELECT, QUIT等指令时+1
     :param trans_active: 是否启用事务
     :param cmd_count: 请求命令个数
     """
-    
     if not buf or not isinstance(buf, str):
         return False, None, buf
 
-    #期待最小长度
-    #+OK\r\n
-    expect_minlen = 5 if has_select else 0
+    assert isinstance(connect_count, int) and connect_count >= 0
+
+    #期待最小长度(+OK\r\n)，当connect_count为0时，为0
+    #正常情况下AUTH,SELECT返回+OK\r\n，此处将ECHO,PING作为普通命令看待
+    expect_minlen = CONNECT_RESP_LEN * connect_count
     if trans_active:
         #+OK\r\n
         expect_minlen += 5
@@ -184,19 +189,21 @@ def decode_resp_ondemand(buf, has_select, trans_active, cmd_count):
 
     cursor = 0
     #需判定是否内容也符合
-    if has_select:
-        ok, p, remain = decode_redis_resp(buf[:5])
+    for i in xrange(connect_count):
+        end = (i + 1) * CONNECT_RESP_LEN
+        ok, p, remain = decode_redis_resp(buf[i * CONNECT_RESP_LEN: end])
         #判定是否为OK
         if not ok:
             return False, None, buf
         if 1 != len(p) or 'OK' != p[0]:
             return False, None, buf
-        cursor = 5
-        
+        cursor = end
+
     #TODO: 需排除以+前缀的命令字符串
     if trans_active:
         #需要排除*1r\n这种提示符
         s = buf[cursor:]
+        #+1： MULTI指令应答为+OK\r\n+QUEUED\r\n * n
         ok, p, remain = decode_redis_resp(s, 1 + cmd_count)
         if not ok:
             return False, None, buf
@@ -211,82 +218,12 @@ def decode_resp_ondemand(buf, has_select, trans_active, cmd_count):
     ok, p, remain = decode_redis_resp(buf[cursor:], cmd_count)
     if not ok:
         return False, None, remain
+
+    assert isinstance(p, (list, tuple))
+    if trans_active:
+        p = p[0]
         
     if len(p) != cmd_count:
         return False, None, remain
         
     return True, p[0] if 1 == cmd_count else p, remain
-    
-    
-from collections import deque
-
-
-def build_sample():
-    s = ['+OK\r\n+OK\r\n+QUEUED\r\n*1\r\n$-1\r\n']
-    tot = 50000
-    cmd_env = deque()
-    cmd_env.append((True, True, 1))
-    
-    for _ in xrange(tot):
-        cmd_env.append((False, True, 1))
-        s.append('+OK\r\n+QUEUED\r\n*1\r\n$-1\r\n')
-        
-    return cmd_env, ''.join(s)
-    
-
-env, recv = build_sample()
-
-
-def main():
-    global env
-    global recv    
-    
-    idx = 0
-    for select, trans, count in env:
-        ok, payload, recv = decode_resp_ondemand(recv, select, trans, count)
-        if not ok:
-            break
-
-        idx += 1
-        if 1 == count:
-            payload = payload[0]
-
-    print 'recv:%r' % recv
-    for _ in xrange(idx):
-        env.popleft()
-        
-        
-#该函数性能不是问题
-"""
-         620076 function calls (610075 primitive calls) in 0.985 seconds
-
-   Ordered by: standard name
-
-   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
-        1    0.000    0.000    0.985    0.985 <string>:1(<module>)
-30004/20003    0.140    0.000    0.821    0.000 redis_resp.py:104(decode_redis_resp)
-    10001    0.109    0.000    0.938    0.000 redis_resp.py:161(decode_resp_ondemand)
-    20003    0.196    0.000    0.229    0.000 redis_resp.py:18(_single_line)
-        1    0.045    0.045    0.985    0.985 redis_resp.py:240(main)
-    10001    0.168    0.000    0.185    0.000 redis_resp.py:42(_bulk)
-    10001    0.180    0.000    0.446    0.000 redis_resp.py:73(_batch)
-    40005    0.008    0.000    0.008    0.000 {isinstance}
-   280031    0.052    0.000    0.052    0.000 {len}
-    40005    0.010    0.000    0.010    0.000 {method 'append' of 'list' objects}
-        1    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
-    50006    0.011    0.000    0.011    0.000 {method 'get' of 'dict' objects}
-    40005    0.009    0.000    0.009    0.000 {method 'group' of '_sre.SRE_Match' objects}
-    10001    0.009    0.000    0.009    0.000 {method 'groupdict' of '_sre.SRE_Match' objects}
-    30004    0.009    0.000    0.009    0.000 {method 'groups' of '_sre.SRE_Match' objects}
-    10001    0.002    0.000    0.002    0.000 {method 'popleft' of 'collections.deque' objects}
-    40005    0.036    0.000    0.036    0.000 {method 'search' of '_sre.SRE_Pattern' objects}
-    
-"""    
-        
-import cProfile
-
-if __name__ == '__main__':
-    cProfile.run('main()')
-    
-    
-    

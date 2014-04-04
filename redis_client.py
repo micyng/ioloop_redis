@@ -12,113 +12,15 @@ from tornado.concurrent import TracebackFuture
 from tornado.iostream import IOStream
 from tornado.stack_context import ExceptionStackContext, NullContext
 from urlparse import urlparse
-from itertools import imap
 import socket
 from .redis_resp import decode_resp_ondemand
+from .redis_encode import chain_select_cmd, _encode_req, redis_auth
 from collections import deque
 
 
 RESP_ERR = 'err'
 _RESP_FUTURE = 'future'
 RESP_RESULT = 'r'
-
-_SYM_STAR = '*'
-_SYM_DOLLAR = '$'
-_SYM_CRLF = '\r\n'
-_SYM_EMPTY = ''
-
-
-def _parse_redis_url(url):
-    """解析redis字符串
-    :param url: redis://<ip>:<port>/db
-    """
-    url = urlparse(url)
-
-    ip, port = url.netloc.split(':')
-    port = int(port)
-
-    db = int(url.path[1:])
-    return ip, port, db
-
-
-def __encode(value, encoding='utf-8', encoding_errors='strict'):
-    """Return a bytestring representation of the value
-    """
-    if isinstance(value, bytes):
-        return value
-    if isinstance(value, float):
-        return repr(value)
-    if not isinstance(value, str):
-        return str(value)
-    if isinstance(value, unicode):
-        return value.encode(encoding, encoding_errors)
-    return value
-
-
-def _encode_req(*args):
-    """编码请求格式, 从Redis库中摘来
-    """
-    args_output = _SYM_EMPTY.join(
-        [_SYM_EMPTY.join((_SYM_DOLLAR, str(len(k)), _SYM_CRLF, k, _SYM_CRLF)) for k in imap(__encode, args)])
-    return _SYM_EMPTY.join((_SYM_STAR, str(len(args)), _SYM_CRLF, args_output))
-
-
-def redis_pub(ch, msg):
-    assert ch and isinstance(ch, str)
-    assert msg and isinstance(msg, str)
-
-    return _encode_req('PUBLISH', ch, msg)
-
-
-def redis_hget(name, key):
-    assert name and isinstance(name, str)
-    assert key and isinstance(key, str)
-
-    return _encode_req('HGET', name, key)
-
-
-def redis_hset(name, key):
-    return _encode_req('HSET', name, key)
-
-
-def redis_get(key):
-    assert key and isinstance(key, str)
-
-    return _encode_req('GET', key)
-
-
-def redis_set(key, value):
-    return _encode_req('SET', key, value)
-
-
-def redis_incre(key):
-    return _encode_req('INCR', key)
-
-
-def redis_incre_by(key, value):
-    return _encode_req('INCRBY', key, value)
-
-
-def redis_incre_byfloat(key, f):
-    return _encode_req('INCRBYFLOAT', key, f)
-
-
-def redis_lpop(key):
-    """从列表中弹出首元素
-
-    :param key: 键值
-    """
-    return _encode_req('LPOP', key)
-
-
-def chain_select_cmd(db, cmd):
-    """
-    选择库的同时发送指令，作为一个pipe
-    """
-    assert isinstance(db, int) and 0 <= db <= 15
-    assert cmd and isinstance(cmd, str)
-
-    return ''.join((_encode_req('SELECT', db), cmd))
 
 
 def _chain_cmds(trans, *args):
@@ -142,18 +44,33 @@ def _chain_cmds(trans, *args):
     return cmds
 
 
+def _parse_redis_url(url):
+    """解析redis字符串
+    :param url: redis://<ip>:<port>/db
+    """
+    url = urlparse(url)
+
+    ip, port = url.netloc.split(':')
+    port = int(port)
+
+    db = int(url.path[1:])
+    return ip, port, db
+
+
 class AsyncRedis(object):
     """
     一个redis地址对应一个AsyncRedis对象
     维护一个RedisConnection对象
     """
 
-    def __init__(self, redis_uri):
+    def __init__(self, redis_uri, redis_pass=None):
         """
         :param redis_uri: redis://<ip>:<port>/<db>
+        :param redis_pass: redis密码
         """
         self.__io_loop = IOLoop.instance()
         self.__uri = _parse_redis_url(redis_uri)
+        self.__password = redis_pass
         self.__conn = None
 
     def invoke(self, *args):
@@ -161,7 +78,7 @@ class AsyncRedis(object):
 
         :param args: 多条redis指令
         """
-        #开启multi
+        #默认开启multi
         active_trans = True
 
         write_buf = _chain_cmds(active_trans, *args)
@@ -179,7 +96,7 @@ class AsyncRedis(object):
 
         with NullContext():
             if self.__conn is None:
-                self.__conn = _RedisConnection(self.__io_loop, write_buf, handle_resp, self.__uri)
+                self.__conn = _RedisConnection(self.__io_loop, write_buf, handle_resp, self.__uri, self.__password)
                 self.__conn.connect(future, self.__uri, active_trans, len(args))
             else:
                 self.__conn.write(write_buf, future, False, active_trans, len(args))
@@ -187,21 +104,33 @@ class AsyncRedis(object):
 
 
 class _RedisConnection(object):
-    def __init__(self, io_loop, init_buf, final_callback, redis_tuple):
+    def __init__(self, io_loop, init_buf, final_callback, redis_tuple, redis_pass):
         """
         :param io_loop: 你懂的
         :param init_buf: 第一次写入
         :param final_callback: resp赋值时调用
         :param redis_tuple: (ip, port, db)
+        :param redis_pass: redis密码
         """
         self.__io_loop = io_loop
         self.__final_cb = final_callback
         self.__stream = None
         #redis应答解析remain
         self.__recv_buf = ''
-        self.__init_buf = chain_select_cmd(redis_tuple[2], init_buf or '')
+
+        init_buf = init_buf or ''
+        init_buf = chain_select_cmd(redis_tuple[2], init_buf)
+        if redis_pass is None:
+            self.__init_buf = (init_buf,)
+        else:
+            assert redis_pass and isinstance(redis_pass, str)
+            self.__init_buf = (redis_auth(redis_pass), init_buf)
+
+        self.__haspass = redis_pass is not None
+        self.__init_buf = ''.join(self.__init_buf)
+
         self.__connected = False
-        #redis指令上下文, 是否包含select，trans，cmd_count
+        #redis指令上下文, connect指令个数(AUTH, SELECT .etc)，trans，cmd_count
         self.__cmd_env = deque()
         self.__written = False
 
@@ -214,8 +143,8 @@ class _RedisConnection(object):
         """
         if self.__stream is not None:
             return
-        #future, include_select, transaction, cmd_count
-        self.__cmd_env.append((init_future, True, active_trans, cmd_count))
+        #future, connect_count, transaction, cmd_count
+        self.__cmd_env.append((init_future, 1 + int(self.__haspass), active_trans, cmd_count))
         with ExceptionStackContext(self.__handle_ex):
             self.__stream = IOStream(socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0),
                                      io_loop=self.__io_loop)
@@ -233,7 +162,7 @@ class _RedisConnection(object):
             self.__init_buf = None
             return
 
-        self.__cmd_env.append((new_future, include_select, active_trans, cmd_count))
+        self.__cmd_env.append((new_future, int(include_select), active_trans, cmd_count))
         if not self.__connected:
             self.__init_buf = ''.join((self.__init_buf, write_buf))
             return
@@ -259,14 +188,12 @@ class _RedisConnection(object):
         recv = ''.join((self.__recv_buf, recv))
 
         idx = 0
-        for future, select, trans, count in self.__cmd_env:
-            ok, payload, recv = decode_resp_ondemand(recv, select, trans, count)
+        for future, connect_count, trans, count in self.__cmd_env:
+            ok, payload, recv = decode_resp_ondemand(recv, connect_count, trans, count)
             if not ok:
                 break
 
             idx += 1
-            if 1 == count:
-                payload = payload[0]
             self.__run_callback({_RESP_FUTURE: future, RESP_RESULT: payload})
 
         self.__recv_buf = recv
