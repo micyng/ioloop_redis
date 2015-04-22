@@ -12,7 +12,7 @@ _int_pat = re.compile(r'^:(-?\d+?)\r\n')
 _err_pat = re.compile(r'^-([^\r\n]+?)\r\n')
 _single_pat = re.compile(r'^\+([^\r\n]+?)\r\n')
 #批应答
-_batch_pat = re.compile(r'\*(?P<count>\d+?)\r\n')
+_batch_pat = re.compile(r'\*(?P<count>-?\d+?)\r\n')
 
 
 def _single_line(s):
@@ -81,7 +81,9 @@ def _batch(s):
         return False, None, None
 
     count = int(m.groupdict().get('count'))
-    if 0 == count:
+    if -1 == count:
+        return True, None, s[m.end():]
+    elif 0 == count:
         return True, (), s[m.end():]
 
     s = s[m.end():]
@@ -124,8 +126,13 @@ def decode_redis_resp(s, batch_count=None):
 
     batch_count用于batch指令个数
     """
-    if not s or not isinstance(s, str) or len(s) < 3:
-        return False, None, s
+    if s is None:
+        return False, None, ''
+    if isinstance(s, str):
+        if not s:
+            return True, None, ''
+        if len(s) < 3:
+            return False, None, s
 
     remain = s
     result = []
@@ -173,7 +180,8 @@ def decode_resp_ondemand(buf, connect_count, trans_active, cmd_count):
     if not buf or not isinstance(buf, str):
         return False, None, buf
 
-    assert isinstance(connect_count, int) and connect_count >= 0
+    if not (isinstance(connect_count, int) and connect_count >= 0):
+        raise ValueError('connect invalid: {0}'.format(connect_count))
 
     #期待最小长度(+OK\r\n)，当connect_count为0时，为0
     #正常情况下AUTH,SELECT返回+OK\r\n，此处将ECHO,PING作为普通命令看待
@@ -215,15 +223,35 @@ def decode_resp_ondemand(buf, connect_count, trans_active, cmd_count):
             return False, None, buf
         cursor = expect_minlen
 
+    if not cmd_count:
+        if connect_count:
+            #连接态
+            return True, None, buf[cursor:]
+        if not trans_active:
+            return False, None, buf[cursor:]
+
+        #对于有连接指令或者事务启用的情况，ok为False则早已返回
+        #木有cmd_count
+        ok, p, remain = decode_redis_resp(buf[cursor:], 1)
+        if not ok:
+            del remain
+            return False, None, buf[cursor:]
+        if isinstance(p, (list, tuple)) and 1 == len(p):
+            p = p[0]
+        return ok, p, remain
+
     ok, p, remain = decode_redis_resp(buf[cursor:], cmd_count)
     if not ok:
-        return False, None, remain
+        del remain
+        return False, None, buf[cursor:]
 
     assert isinstance(p, (list, tuple))
     if trans_active:
         p = p[0]
         
     if len(p) != cmd_count:
-        return False, None, remain
-        
+        del remain
+        return False, None, buf[cursor:]
+
+    #从业务调用简单考虑，当cmd_count为1时直接返回列表第一个元素
     return True, p[0] if 1 == cmd_count else p, remain
